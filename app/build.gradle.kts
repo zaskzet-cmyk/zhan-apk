@@ -34,7 +34,16 @@ android {
         versionName = "1.0"
     }
 
+    compileOptions {
+        sourceCompatibility = JavaVersion.VERSION_17
+        targetCompatibility = JavaVersion.VERSION_17
+    }
+
     sourceSets.getByName("main").assets.srcDir(generatedWebAssets)
+}
+
+kotlin {
+    jvmToolchain(17)
 }
 
 tasks.named("preBuild").configure {
