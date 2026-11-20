@@ -1,410 +1,380 @@
 package com.zhan.personal
 
-import android.app.ActivityManager
-import android.os.BatteryManager
+import android.app.AlarmManager
+import android.app.TimePickerDialog
+import android.content.Intent
 import android.graphics.Color
 import android.net.Uri
+import android.os.BatteryManager
 import android.os.Build
 import android.os.Bundle
 import android.os.Environment
 import android.os.StatFs
+import android.provider.CalendarContract
 import android.provider.DocumentsContract
-import android.util.Log
+import android.text.format.DateFormat
+import android.view.Gravity
+import android.view.View
 import android.view.ViewGroup
-import android.webkit.JavascriptInterface
-import android.webkit.ValueCallback
-import android.webkit.WebChromeClient
-import android.webkit.WebResourceRequest
-import android.webkit.WebResourceResponse
-import android.webkit.WebSettings
-import android.webkit.WebView
-import android.widget.FrameLayout
+import android.widget.Button
+import android.widget.CheckBox
+import android.widget.LinearLayout
+import android.widget.ScrollView
+import android.widget.TextView
+import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.result.contract.ActivityResultContracts
-import androidx.webkit.WebViewAssetLoader
-import androidx.webkit.WebViewClientCompat
-import org.json.JSONArray
-import org.json.JSONException
 import org.json.JSONObject
-import java.io.FileNotFoundException
 import java.util.ArrayDeque
-import java.util.UUID
-import java.util.concurrent.ConcurrentHashMap
+import java.util.Calendar
 import java.util.concurrent.Executors
-import java.util.concurrent.atomic.AtomicInteger
 
 class MainActivity : ComponentActivity() {
-    private lateinit var webView: WebView
-    private var pendingFileCallback: ValueCallback<Array<Uri>>? = null
-    @Volatile
-    private var selectedTreeUri: Uri? = null
-    private val storageExecutor = Executors.newSingleThreadExecutor()
-    private val scanGeneration = AtomicInteger()
-    private val storageFileUris = ConcurrentHashMap<String, Uri>()
-
-    private val filePicker = registerForActivityResult(ActivityResultContracts.GetMultipleContents()) { uris ->
-        pendingFileCallback?.onReceiveValue(uris.toTypedArray())
-        pendingFileCallback = null
-    }
+    private val background = Executors.newSingleThreadExecutor()
+    private lateinit var content: LinearLayout
+    private lateinit var deviceInfo: TextView
+    private lateinit var folderStatus: TextView
+    private lateinit var fileList: LinearLayout
+    private var selectedTree: Uri? = null
+    private val files = mutableListOf<StorageFile>()
+    private val selectedFiles = linkedSetOf<Uri>()
 
     private val folderPicker = registerForActivityResult(ActivityResultContracts.OpenDocumentTree()) { uri ->
-        if (uri == null) {
-            deliverFolderResult(JSONObject().put("cancelled", true))
-            return@registerForActivityResult
+        if (uri == null) return@registerForActivityResult
+        try {
+            contentResolver.takePersistableUriPermission(
+                uri,
+                Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION
+            )
+        } catch (_: SecurityException) {
+            // Some document providers grant access only for the current session.
         }
-        selectedTreeUri = uri
-        scanSelectedFolder(uri)
+        selectedTree = uri
+        getPreferences(MODE_PRIVATE).edit().putString(PREF_TREE_URI, uri.toString()).apply()
+        scanSelectedFolder()
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        window.statusBarColor = BG
+        window.navigationBarColor = BG
+        window.decorView.systemUiVisibility = 0
+        buildNativeScreen()
+        selectedTree = getPreferences(MODE_PRIVATE).getString(PREF_TREE_URI, null)?.let(Uri::parse)
+        refreshDeviceInfo()
+        if (selectedTree != null) scanSelectedFolder()
+    }
 
-        window.statusBarColor = Color.rgb(9, 9, 11)
-        window.navigationBarColor = Color.rgb(9, 9, 11)
+    private fun buildNativeScreen() {
+        val scroll = ScrollView(this).apply {
+            setBackgroundColor(BG)
+            isFillViewport = true
+        }
+        content = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(20), dp(24), dp(20), dp(28))
+        }
+        scroll.addView(content)
+        setContentView(scroll)
 
-        val assetLoader = WebViewAssetLoader.Builder()
-            .addPathHandler("/assets/", WebViewAssetLoader.AssetsPathHandler(this))
+        text("ZHAN", 13, ACCENT, true).also { content.addView(it) }
+        text("Panel perangkat", 29, WHITE, true).also { content.addView(it, margins(bottom = 5)) }
+        text("Aplikasi Android native • Alarm, kalender, dan penyimpanan", 14, MUTED)
+            .also { content.addView(it, margins(bottom = 22)) }
+
+        section("ALARM")
+        text("Kelola alarm menggunakan aplikasi Jam yang tersedia di perangkat.", 14, MUTED)
+            .also { content.addView(it, margins(bottom = 10)) }
+        content.addView(actionButton("Buka daftar alarm") { openAlarms() }, margins(bottom = 9))
+        content.addView(actionButton("Setel alarm…") { chooseAlarmTime() }, margins(bottom = 20))
+
+        section("KALENDER")
+        text("Buka kalender atau buat acara baru. Aplikasi kalender akan meminta konfirmasi sebelum menyimpan.", 14, MUTED)
+            .also { content.addView(it, margins(bottom = 10)) }
+        content.addView(actionButton("Buka kalender") { openCalendar() }, margins(bottom = 9))
+        content.addView(actionButton("Tambah acara…") { createCalendarEvent() }, margins(bottom = 20))
+
+        section("INFO PERANGKAT")
+        deviceInfo = text("Memuat informasi…", 14, WHITE)
+        deviceInfo.setPadding(dp(14), dp(14), dp(14), dp(14))
+        deviceInfo.setBackgroundColor(CARD)
+        content.addView(deviceInfo, margins(bottom = 9))
+        content.addView(actionButton("Perbarui info") { refreshDeviceInfo() }, margins(bottom = 20))
+
+        section("PENYIMPANAN")
+        text("Pilih folder untuk meninjau file. Akses hanya diberikan ke folder yang kamu pilih.", 14, MUTED)
+            .also { content.addView(it, margins(bottom = 10)) }
+        content.addView(actionButton("Pilih folder") { folderPicker.launch(null) }, margins(bottom = 9))
+        folderStatus = text("Belum ada folder dipilih.", 13, MUTED)
+        content.addView(folderStatus, margins(bottom = 8))
+        content.addView(actionButton("Pindai ulang") { scanSelectedFolder() }, margins(bottom = 9))
+        content.addView(actionButton("Hapus file terpilih") { confirmDeleteSelected() }, margins(bottom = 12))
+        fileList = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        content.addView(fileList)
+
+        text("Alarm dan kalender dibuka melalui aplikasi Android terkait; Zhan tidak meminta izin membaca data pribadi kalender.", 12, MUTED)
+            .also { content.addView(it, margins(top = 20)) }
+    }
+
+    private fun openAlarms() {
+        launchIntent(Intent(AlarmClock.ACTION_SHOW_ALARMS), "Tidak ditemukan aplikasi Jam.")
+    }
+
+    private fun chooseAlarmTime() {
+        val now = Calendar.getInstance()
+        TimePickerDialog(
+            this,
+            { _, hour, minute ->
+                val intent = Intent(AlarmClock.ACTION_SET_ALARM)
+                    .putExtra(AlarmClock.EXTRA_HOUR, hour)
+                    .putExtra(AlarmClock.EXTRA_MINUTES, minute)
+                    .putExtra(AlarmClock.EXTRA_MESSAGE, "Alarm dari Zhan")
+                    .putExtra(AlarmClock.EXTRA_SKIP_UI, false)
+                launchIntent(intent, "Perangkat tidak menyediakan aplikasi untuk menyetel alarm.")
+            },
+            now.get(Calendar.HOUR_OF_DAY),
+            now.get(Calendar.MINUTE),
+            DateFormat.is24HourFormat(this)
+        ).show()
+    }
+
+    private fun openCalendar() {
+        val calendarUri = CalendarContract.CONTENT_URI.buildUpon()
+            .appendPath("time")
+            .appendPath(System.currentTimeMillis().toString())
             .build()
+        launchIntent(Intent(Intent.ACTION_VIEW, calendarUri), "Tidak ditemukan aplikasi kalender.")
+    }
 
-        webView = WebView(this).apply {
-            setBackgroundColor(Color.rgb(9, 9, 11))
-            isVerticalScrollBarEnabled = false
-            layoutParams = FrameLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT,
-                ViewGroup.LayoutParams.MATCH_PARENT
-            )
-            settings.apply {
-                javaScriptEnabled = true
-                domStorageEnabled = true
-                databaseEnabled = true
-                allowFileAccess = false
-                allowContentAccess = false
-                mixedContentMode = WebSettings.MIXED_CONTENT_NEVER_ALLOW
-                javaScriptCanOpenWindowsAutomatically = false
-                setSupportMultipleWindows(false)
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                    safeBrowsingEnabled = true
-                }
-            }
-            webViewClient = object : WebViewClientCompat() {
-                override fun shouldInterceptRequest(
-                    view: WebView,
-                    request: WebResourceRequest
-                ): WebResourceResponse? {
-                    return assetLoader.shouldInterceptRequest(request.url)
-                        ?: super.shouldInterceptRequest(view, request)
-                }
+    private fun createCalendarEvent() {
+        val start = Calendar.getInstance().apply { add(Calendar.HOUR_OF_DAY, 1); set(Calendar.MINUTE, 0); set(Calendar.SECOND, 0) }
+        val end = (start.clone() as Calendar).apply { add(Calendar.HOUR_OF_DAY, 1) }
+        val intent = Intent(Intent.ACTION_INSERT, CalendarContract.Events.CONTENT_URI)
+            .putExtra(CalendarContract.Events.TITLE, "Acara baru")
+            .putExtra(CalendarContract.EXTRA_EVENT_BEGIN_TIME, start.timeInMillis)
+            .putExtra(CalendarContract.EXTRA_EVENT_END_TIME, end.timeInMillis)
+        launchIntent(intent, "Tidak ditemukan aplikasi kalender yang bisa membuat acara.")
+    }
 
-                override fun shouldOverrideUrlLoading(view: WebView, request: WebResourceRequest): Boolean {
-                    val url = request.url
-                    return url.scheme != "https" ||
-                        url.host != ASSET_HOST ||
-                        !url.path.orEmpty().startsWith("/assets/")
-                }
+    private fun launchIntent(intent: Intent, error: String) {
+        try {
+            if (intent.resolveActivity(packageManager) == null) {
+                toast(error)
+            } else {
+                startActivity(intent)
             }
-            webChromeClient = object : WebChromeClient() {
-                override fun onShowFileChooser(
-                    view: WebView,
-                    filePathCallback: ValueCallback<Array<Uri>>,
-                    fileChooserParams: FileChooserParams
-                ): Boolean {
-                    pendingFileCallback?.onReceiveValue(null)
-                    pendingFileCallback = filePathCallback
-                    this@MainActivity.filePicker.launch("*/*")
-                    return true
-                }
-            }
-        }
-
-        webView.addJavascriptInterface(AndroidBridge(), "ZhanAndroid")
-        setContentView(webView)
-        if (savedInstanceState == null || webView.restoreState(savedInstanceState) == null) {
-            webView.loadUrl("https://$ASSET_HOST/assets/index.html?platform=android")
+        } catch (_: Exception) {
+            toast(error)
         }
     }
 
-    private fun scanSelectedFolder(treeUri: Uri) {
-        val generation = scanGeneration.incrementAndGet()
-        storageExecutor.execute {
+    private fun refreshDeviceInfo() {
+        val battery = (getSystemService(BATTERY_SERVICE) as? BatteryManager)
+            ?.getIntProperty(BatteryManager.BATTERY_PROPERTY_CAPACITY)?.takeIf { it >= 0 }
+            ?.let { "$it%" } ?: "Tidak tersedia"
+        val stat = StatFs(Environment.getDataDirectory().absolutePath)
+        val total = stat.totalBytes
+        val free = stat.availableBytes
+        val text = "Model: ${Build.MANUFACTURER} ${Build.MODEL}\n" +
+            "Android: ${Build.VERSION.RELEASE} (API ${Build.VERSION.SDK_INT})\n" +
+            "Baterai: $battery\n" +
+            "Penyimpanan internal: ${formatBytes(total - free)} tersedia dari ${formatBytes(total)}\n" +
+            "Layar: ${resources.displayMetrics.widthPixels} × ${resources.displayMetrics.heightPixels}"
+        deviceInfo.text = text
+    }
+
+    private fun scanSelectedFolder() {
+        val tree = selectedTree
+        if (tree == null) {
+            toast("Pilih folder terlebih dahulu.")
+            return
+        }
+        folderStatus.text = "Memindai folder…"
+        fileList.removeAllViews()
+        selectedFiles.clear()
+        background.execute {
             val result = try {
-                scanFolder(treeUri)
-            } catch (error: SecurityException) {
-                Log.e(TAG, "Folder pilihan tidak dapat dibaca.", error)
-                JSONObject().put("error", "Akses ke folder pilihan tidak tersedia.")
-            } catch (error: IllegalArgumentException) {
-                Log.e(TAG, "Folder pilihan memiliki URI yang tidak valid.", error)
-                JSONObject().put("error", "Folder pilihan tidak valid.")
-            } catch (error: UnsupportedOperationException) {
-                Log.e(TAG, "Penyedia dokumen tidak mendukung pemindaian folder.", error)
-                JSONObject().put("error", "Folder ini tidak mendukung peninjauan file.")
+                scanTree(tree)
+            } catch (error: Exception) {
+                ScanResult("Folder tidak dapat dibaca: ${error.localizedMessage ?: error.javaClass.simpleName}", emptyList())
             }
             runOnUiThread {
-                if (generation == scanGeneration.get() && !isFinishing) {
-                    deliverFolderResult(result)
+                if (isFinishing || isDestroyed) return@runOnUiThread
+                files.clear()
+                files.addAll(result.files)
+                folderStatus.text = "${result.folderName} • ${files.size} file ditemukan${if (files.size >= MAX_FILES) " (batas pemindaian tercapai)" else ""}"
+                renderFiles()
+                if (files.isEmpty() && !result.folderName.startsWith("Folder tidak dapat")) {
+                    fileList.addView(text("Folder ini belum berisi file yang ditemukan.", 13, MUTED), margins(top = 6))
                 }
             }
         }
     }
 
-    private fun scanFolder(treeUri: Uri): JSONObject {
-        storageFileUris.clear()
-        val files = JSONArray()
-        val errors = JSONArray()
-        val queue = ArrayDeque<FolderEntry>()
-        val rootDocumentId = DocumentsContract.getTreeDocumentId(treeUri)
-        val rootUri = DocumentsContract.buildDocumentUriUsingTree(treeUri, rootDocumentId)
-        val folderName = queryDisplayName(rootUri) ?: "Folder dipilih"
-        queue.add(FolderEntry(rootDocumentId, "", 0))
+    private fun scanTree(tree: Uri): ScanResult {
+        val rootId = DocumentsContract.getTreeDocumentId(tree)
+        val rootUri = DocumentsContract.buildDocumentUriUsingTree(tree, rootId)
+        val name = queryName(rootUri) ?: "Folder dipilih"
+        val queue = ArrayDeque<Entry>()
+        val found = mutableListOf<StorageFile>()
+        queue.add(Entry(rootId, "", 0))
         var visited = 0
-
-        while (queue.isNotEmpty() && files.length() < MAX_STORAGE_FILES && visited < MAX_STORAGE_ENTRIES) {
+        while (queue.isNotEmpty() && found.size < MAX_FILES && visited < MAX_ENTRIES) {
             val entry = queue.removeFirst()
-            val childrenUri = DocumentsContract.buildChildDocumentsUriUsingTree(treeUri, entry.documentId)
-            val cursor = try {
-                contentResolver.query(
-                    childrenUri,
-                    STORAGE_PROJECTION,
-                    null,
-                    null,
-                    null
-                )
-            } catch (error: SecurityException) {
-                Log.e(TAG, "Tidak dapat membaca item di ${entry.relativePath}.", error)
-                errors.put(entry.relativePath)
-                null
-            } catch (error: IllegalArgumentException) {
-                Log.e(TAG, "URI isi folder tidak valid: ${entry.relativePath}.", error)
-                errors.put(entry.relativePath)
-                null
-            } catch (error: UnsupportedOperationException) {
-                Log.e(TAG, "Penyedia dokumen tidak mendukung pembacaan folder ${entry.relativePath}.", error)
-                errors.put(entry.relativePath)
-                null
-            }
-            if (cursor == null) {
-                Log.w(TAG, "Penyedia dokumen tidak memberi daftar untuk ${entry.relativePath}.")
-                errors.put(entry.relativePath)
-                continue
-            }
-
-            cursor.use {
-                val idColumn = it.getColumnIndexOrThrow(DocumentsContract.Document.COLUMN_DOCUMENT_ID)
-                val nameColumn = it.getColumnIndexOrThrow(DocumentsContract.Document.COLUMN_DISPLAY_NAME)
-                val mimeColumn = it.getColumnIndexOrThrow(DocumentsContract.Document.COLUMN_MIME_TYPE)
-                val sizeColumn = it.getColumnIndexOrThrow(DocumentsContract.Document.COLUMN_SIZE)
-                val modifiedColumn = it.getColumnIndexOrThrow(DocumentsContract.Document.COLUMN_LAST_MODIFIED)
-                while (
-                    it.moveToNext() &&
-                    files.length() < MAX_STORAGE_FILES &&
-                    visited < MAX_STORAGE_ENTRIES
-                ) {
-                    visited += 1
-                    val documentId = it.getString(idColumn) ?: continue
-                    val name = it.getString(nameColumn) ?: continue
-                    val path = if (entry.relativePath.isEmpty()) name else "${entry.relativePath}/$name"
-                    if (it.getString(mimeColumn) == DocumentsContract.Document.MIME_TYPE_DIR) {
-                        if (entry.depth < MAX_STORAGE_DEPTH) {
-                            queue.addLast(FolderEntry(documentId, path, entry.depth + 1))
-                        } else {
-                            errors.put(path)
-                        }
-                        continue
+            val children = DocumentsContract.buildChildDocumentsUriUsingTree(tree, entry.id)
+            val cursor = contentResolver.query(children, PROJECTION, null, null, null) ?: continue
+            cursor.use { c ->
+                val idCol = c.getColumnIndex(DocumentsContract.Document.COLUMN_DOCUMENT_ID)
+                val nameCol = c.getColumnIndex(DocumentsContract.Document.COLUMN_DISPLAY_NAME)
+                val mimeCol = c.getColumnIndex(DocumentsContract.Document.COLUMN_MIME_TYPE)
+                val sizeCol = c.getColumnIndex(DocumentsContract.Document.COLUMN_SIZE)
+                val modifiedCol = c.getColumnIndex(DocumentsContract.Document.COLUMN_LAST_MODIFIED)
+                if (idCol < 0 || nameCol < 0 || mimeCol < 0) return@use
+                while (c.moveToNext() && found.size < MAX_FILES && visited < MAX_ENTRIES) {
+                    visited++
+                    val id = c.getString(idCol) ?: continue
+                    val displayName = c.getString(nameCol) ?: continue
+                    val relative = if (entry.path.isEmpty()) displayName else "${entry.path}/$displayName"
+                    if (c.getString(mimeCol) == DocumentsContract.Document.MIME_TYPE_DIR) {
+                        if (entry.depth < MAX_DEPTH) queue.add(Entry(id, relative, entry.depth + 1))
+                    } else {
+                        val uri = DocumentsContract.buildDocumentUriUsingTree(tree, id)
+                        found.add(StorageFile(uri, displayName, relative,
+                            if (sizeCol >= 0 && !c.isNull(sizeCol)) c.getLong(sizeCol) else 0L,
+                            if (modifiedCol >= 0 && !c.isNull(modifiedCol)) c.getLong(modifiedCol) else 0L))
                     }
-
-                    val fileId = UUID.randomUUID().toString()
-                    storageFileUris[fileId] = DocumentsContract.buildDocumentUriUsingTree(treeUri, documentId)
-                    files.put(
-                        JSONObject()
-                            .put("androidId", fileId)
-                            .put("name", name)
-                            .put("size", if (it.isNull(sizeColumn)) 0 else it.getLong(sizeColumn))
-                            .put("lastModified", if (it.isNull(modifiedColumn)) 0 else it.getLong(modifiedColumn))
-                            .put("relativePath", path)
-                    )
                 }
             }
         }
-        if (queue.isNotEmpty() || visited >= MAX_STORAGE_ENTRIES || files.length() >= MAX_STORAGE_FILES) {
-            errors.put("Pemindaian dibatasi untuk menjaga kinerja perangkat.")
-        }
-        return JSONObject()
-            .put("folderName", folderName)
-            .put("files", files)
-            .put("errors", errors)
+        return ScanResult(name, found)
     }
 
-    private fun queryDisplayName(documentUri: Uri): String? {
-        val cursor = contentResolver.query(
-            documentUri,
-            arrayOf(DocumentsContract.Document.COLUMN_DISPLAY_NAME),
-            null,
-            null,
-            null
-        ) ?: return null
-        cursor.use {
-            if (!it.moveToFirst()) return null
-            val nameColumn = it.getColumnIndexOrThrow(DocumentsContract.Document.COLUMN_DISPLAY_NAME)
-            return it.getString(nameColumn)
+    private fun queryName(uri: Uri): String? {
+        contentResolver.query(uri, arrayOf(DocumentsContract.Document.COLUMN_DISPLAY_NAME), null, null, null)?.use { c ->
+            val column = c.getColumnIndex(DocumentsContract.Document.COLUMN_DISPLAY_NAME)
+            if (column >= 0 && c.moveToFirst()) return c.getString(column)
+        }
+        return null
+    }
+
+    private fun renderFiles() {
+        fileList.removeAllViews()
+        files.forEach { file ->
+            val row = LinearLayout(this).apply {
+                orientation = LinearLayout.HORIZONTAL
+                gravity = Gravity.CENTER_VERTICAL
+                setPadding(dp(8), dp(6), dp(8), dp(6))
+                setBackgroundColor(CARD)
+            }
+            val check = CheckBox(this).apply {
+                buttonTintList = android.content.res.ColorStateList.valueOf(ACCENT)
+                setOnCheckedChangeListener { _, checked ->
+                    if (checked) selectedFiles.add(file.uri) else selectedFiles.remove(file.uri)
+                }
+            }
+            val labels = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+            labels.addView(text(file.name, 14, WHITE, true))
+            val date = if (file.modified > 0) android.text.format.DateFormat.format("yyyy-MM-dd HH:mm", file.modified).toString() else "Waktu tidak tersedia"
+            labels.addView(text("${formatBytes(file.size)} • $date\n${file.path}", 11, MUTED))
+            row.addView(check)
+            row.addView(labels, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+            fileList.addView(row, margins(bottom = 5))
         }
     }
 
-    private fun requestDeleteStorageFiles(idsJson: String) {
-        if (idsJson.length > MAX_DELETE_REQUEST_CHARS) {
-            deliverDeleteResult(JSONObject().put("error", "Daftar file pilihan terlalu besar."))
+    private fun confirmDeleteSelected() {
+        if (selectedFiles.isEmpty()) {
+            toast("Pilih file yang ingin dihapus.")
             return
         }
-        val ids = try {
-            JSONArray(idsJson)
-        } catch (error: JSONException) {
-            deliverDeleteResult(JSONObject().put("error", "Daftar file pilihan tidak valid."))
-            return
-        }
-        if (ids.length() > MAX_STORAGE_FILES) {
-            deliverDeleteResult(JSONObject().put("error", "Jumlah file pilihan melebihi batas."))
-            return
-        }
+        android.app.AlertDialog.Builder(this)
+            .setTitle("Hapus file?")
+            .setMessage("${selectedFiles.size} file akan dihapus melalui penyedia dokumen Android.")
+            .setNegativeButton("Batal", null)
+            .setPositiveButton("Hapus") { _, _ -> deleteSelected() }
+            .show()
+    }
 
-        storageExecutor.execute {
-            val result = deleteStorageFiles(ids)
+    private fun deleteSelected() {
+        val targets = selectedFiles.toList()
+        folderStatus.text = "Menghapus file…"
+        background.execute {
+            var deleted = 0
+            var failed = 0
+            targets.forEach { uri ->
+                try {
+                    if (DocumentsContract.deleteDocument(contentResolver, uri)) deleted++ else failed++
+                } catch (_: Exception) { failed++ }
+            }
             runOnUiThread {
-                deliverDeleteResult(result)
+                if (!isFinishing && !isDestroyed) {
+                    toast("Terhapus: $deleted • gagal: $failed")
+                    scanSelectedFolder()
+                }
             }
         }
     }
 
-    private fun deleteStorageFiles(ids: JSONArray): JSONObject {
-        var deleted = 0
-        var failed = 0
-        for (index in 0 until ids.length()) {
-            val fileId = ids.optString(index)
-            val documentUri = storageFileUris.remove(fileId)
-            if (documentUri == null) {
-                failed += 1
-                continue
-            }
-            try {
-                if (DocumentsContract.deleteDocument(contentResolver, documentUri)) deleted += 1
-                else failed += 1
-            } catch (error: SecurityException) {
-                Log.e(TAG, "Izin menghapus file pilihan tidak tersedia.", error)
-                failed += 1
-            } catch (error: FileNotFoundException) {
-                Log.e(TAG, "File pilihan tidak ditemukan saat dihapus.", error)
-                failed += 1
-            } catch (error: IllegalArgumentException) {
-                Log.e(TAG, "URI file pilihan tidak valid saat dihapus.", error)
-                failed += 1
-            } catch (error: UnsupportedOperationException) {
-                Log.e(TAG, "Penyedia dokumen tidak mendukung penghapusan file pilihan.", error)
-                failed += 1
-            }
-        }
-        return JSONObject().put("deleted", deleted).put("failed", failed)
+    private fun actionButton(label: String, onClick: () -> Unit) = Button(this).apply {
+        text = label
+        isAllCaps = false
+        textSize = 15f
+        setTextColor(WHITE)
+        setBackgroundTintList(android.content.res.ColorStateList.valueOf(BUTTON))
+        setOnClickListener { onClick() }
+        minHeight = dp(50)
     }
 
-    private fun deliverFolderResult(result: JSONObject) {
-        if (!::webView.isInitialized || isFinishing) return
-        val serialized = JSONObject.quote(result.toString())
-        webView.post {
-            webView.evaluateJavascript(
-                "window.onZhanAndroidFolderResult && window.onZhanAndroidFolderResult($serialized);",
-                null
-            )
-        }
+    private fun section(value: String) {
+        content.addView(text(value, 12, ACCENT, true), margins(bottom = 8))
     }
 
-    private fun deliverDeleteResult(result: JSONObject) {
-        if (!::webView.isInitialized || isFinishing) return
-        val serialized = JSONObject.quote(result.toString())
-        webView.post {
-            webView.evaluateJavascript(
-                "window.onZhanAndroidDeleteResult && window.onZhanAndroidDeleteResult($serialized);",
-                null
-            )
-        }
+    private fun text(value: String, size: Int, color: Int, bold: Boolean = false) = TextView(this).apply {
+        text = value
+        textSize = size.toFloat()
+        setTextColor(color)
+        if (bold) setTypeface(typeface, android.graphics.Typeface.BOLD)
+        setLineSpacing(dp(3).toFloat(), 1f)
     }
 
-    private fun buildDeviceInfo(): JSONObject {
-        val activityManager = getSystemService(ACTIVITY_SERVICE) as ActivityManager
-        val memory = ActivityManager.MemoryInfo()
-        activityManager.getMemoryInfo(memory)
-        val storage = StatFs(Environment.getExternalStorageDirectory().path)
-        val batteryManager = getSystemService(BATTERY_SERVICE) as? BatteryManager
-        val display = resources.displayMetrics
-        val packageInfo = packageManager.getPackageInfo(packageName, 0)
-        return JSONObject()
-            .put("manufacturer", Build.MANUFACTURER)
-            .put("model", Build.MODEL)
-            .put("androidVersion", Build.VERSION.RELEASE)
-            .put("sdkLevel", Build.VERSION.SDK_INT)
-            .put("appVersion", packageInfo.versionName ?: "—")
-            .put("batteryPercent", batteryManager?.getIntProperty(BatteryManager.BATTERY_PROPERTY_CAPACITY) ?: -1)
-            .put("ramTotalBytes", memory.totalMem)
-            .put("ramAvailableBytes", memory.availMem)
-            .put("storageTotalBytes", storage.totalBytes)
-            .put("storageAvailableBytes", storage.availableBytes)
-            .put("displayWidth", display.widthPixels)
-            .put("displayHeight", display.heightPixels)
+    private fun margins(top: Int = 0, bottom: Int = 0) = LinearLayout.LayoutParams(
+        ViewGroup.LayoutParams.MATCH_PARENT,
+        ViewGroup.LayoutParams.WRAP_CONTENT
+    ).apply { topMargin = dp(top); bottomMargin = dp(bottom) }
+
+    private fun formatBytes(bytes: Long): String {
+        if (bytes < 1024) return "$bytes B"
+        val units = arrayOf("KB", "MB", "GB", "TB")
+        var value = bytes.toDouble()
+        var unit = -1
+        do { value /= 1024.0; unit++ } while (value >= 1024 && unit < units.lastIndex)
+        return "%.1f %s".format(value, units[unit])
     }
 
-    inner class AndroidBridge {
-        @JavascriptInterface
-        fun getDeviceInfo(): String = buildDeviceInfo().toString()
-
-        @JavascriptInterface
-        fun chooseStorageFolder() {
-            runOnUiThread {
-                if (!isFinishing && !isDestroyed) folderPicker.launch(null)
-            }
-        }
-
-        @JavascriptInterface
-        fun deleteStorageFiles(idsJson: String) = this@MainActivity.requestDeleteStorageFiles(idsJson)
-
-        @JavascriptInterface
-        fun refreshStorageFolder() {
-            val uri = selectedTreeUri
-            if (uri == null) {
-                deliverFolderResult(JSONObject().put("error", "Pilih folder terlebih dahulu."))
-                return
-            }
-            scanSelectedFolder(uri)
-        }
-    }
-
-    override fun onPause() {
-        webView.onPause()
-        super.onPause()
-    }
-
-    override fun onResume() {
-        super.onResume()
-        webView.onResume()
-    }
-
-    override fun onSaveInstanceState(outState: Bundle) {
-        webView.saveState(outState)
-        super.onSaveInstanceState(outState)
-    }
+    private fun dp(value: Int) = (value * resources.displayMetrics.density).toInt()
+    private fun toast(value: String) = Toast.makeText(this, value, Toast.LENGTH_SHORT).show()
 
     override fun onDestroy() {
-        pendingFileCallback?.onReceiveValue(null)
-        pendingFileCallback = null
-        storageExecutor.shutdownNow()
-        webView.destroy()
+        background.shutdownNow()
         super.onDestroy()
     }
 
-    private data class FolderEntry(val documentId: String, val relativePath: String, val depth: Int)
+    private data class Entry(val id: String, val path: String, val depth: Int)
+    private data class StorageFile(val uri: Uri, val name: String, val path: String, val size: Long, val modified: Long)
+    private data class ScanResult(val folderName: String, val files: List<StorageFile>)
 
     companion object {
-        private const val TAG = "ZhanSystem"
-        private const val ASSET_HOST = "appassets.androidplatform.net"
-        private const val MAX_STORAGE_FILES = 1500
-        private const val MAX_STORAGE_ENTRIES = 5000
-        private const val MAX_STORAGE_DEPTH = 10
-        private const val MAX_DELETE_REQUEST_CHARS = MAX_STORAGE_FILES * 64
-        private val STORAGE_PROJECTION = arrayOf(
+        private const val PREF_TREE_URI = "selected_tree_uri"
+        private const val MAX_FILES = 300
+        private const val MAX_ENTRIES = 1500
+        private const val MAX_DEPTH = 8
+        private const val BG = Color.rgb(9, 9, 11)
+        private const val CARD = Color.rgb(25, 25, 30)
+        private const val BUTTON = Color.rgb(43, 43, 51)
+        private const val WHITE = Color.WHITE
+        private const val MUTED = 0xFFAAAAB3.toInt()
+        private const val ACCENT = 0xFFF04452.toInt()
+        private val PROJECTION = arrayOf(
             DocumentsContract.Document.COLUMN_DOCUMENT_ID,
             DocumentsContract.Document.COLUMN_DISPLAY_NAME,
             DocumentsContract.Document.COLUMN_MIME_TYPE,
